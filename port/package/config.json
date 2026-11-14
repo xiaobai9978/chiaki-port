@@ -1,0 +1,9 @@
+{
+"package":"com.chiaki.brick",
+"label":"Chiaki",
+"label.ch.lang":"PS5串流",
+"icon":"",
+"icontop":"icon.png",
+"launch":"launch.sh",
+"description":"PS5 Remote Play"
+}

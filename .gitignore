@@ -1,0 +1,19 @@
+# ---------- 大体积产物 / 上游源码（不入库） ----------
+/build/
+/dist/
+/src/
+
+# ---------- 敏感：含 PS5 regkey / morning key，绝不入库 ----------
+hosts.txt
+hosts*.txt
+**/hosts.txt
+!hosts.example.txt
+
+# ---------- 日志 / 临时文件 ----------
+*.log
+*.zip
+__pycache__/
+*.pyc
+*.o
+*.so
+secrets_local.py
