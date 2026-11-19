@@ -159,9 +159,10 @@ static struct {
     /* 方向键长按连发 */
     Uint32 rep_t0[5];
     Uint32 rep_last[5];
-    Uint32 opt_press_ms;
-    bool   opt_held;
+    Uint32 opt_press_ms;   /* SELECT+START 组合键计时（满 400ms 发 OPTIONS） */
     bool   opt_fired;
+    Uint32 sel_press_ms;   /* 串流中 SELECT 按下时刻：250ms 内没等来 START 才发 SHARE */
+    bool   sel_suppress;   /* 本回合 SELECT 被认定为组合键前半段，SHARE 不发 */
     Uint32 stats_t0;      /* 周期性把串流统计写进日志 */    Uint32 tap_until;
     uint32_t tap_bits;
     bool stream_quit_pending;
@@ -1214,8 +1215,8 @@ static void draw_stream(void)
                 SDL_SetRenderTarget(app.ren, app.osd_hint);
                 SDL_SetRenderDrawColor(app.ren, 0, 0, 0, 0);
                 SDL_RenderClear(app.ren);
-                ui_text_centered(W / 2, 2, UI_SIZE_SMALL, C_DIM,
-                                 "GUIDE=PS   SELECT=SHARE   START=触摸板/长按=OPTIONS");
+                    ui_text_centered(W / 2, 2, UI_SIZE_SMALL, C_DIM,
+                                     "GUIDE=PS   SELECT=SHARE   START=触摸板   SELECT+START=OPTIONS");
                     ui_text_centered(W / 2, 22, UI_SIZE_SMALL, C_DIM,
                                      "L1+R1+L3+R3=菜单   L3+R3 按住 8 秒=OSD 开关");
                 SDL_SetRenderTarget(app.ren, NULL);
@@ -1995,26 +1996,42 @@ static void update_stream(void)
         app.cancel_hold_t0 = 0;
     }
 
-    /* 单击 START = 触摸板，长按（>=600ms）= OPTIONS —— 掌机没有独立触摸板键 */
-    if (pressed(in_now.start, in_prev.start)) {
-        app.opt_press_ms = now;
-        app.opt_held = true;
-        app.opt_fired = false;
+    /* START = 真实按住触摸板（短按=点击，长按=长按，游戏里长按触摸板
+     * 的需求从此满足——之前 START 是 120ms 模拟点击，永远按不住）。
+     * OPTIONS = SELECT+START 同按 0.4 秒。组合期间抑制触摸板按下，
+     * 免得呼出系统菜单前先给游戏糊了 0.4 秒触摸板。
+     * SELECT 单独按下延迟 250ms 才发 SHARE：给组合键留出识别窗口，
+     * 期间等来 START 就整回合不发 SHARE/触摸板。 */
+    if (in_now.select) {
+        if (!app.sel_press_ms) {
+            app.sel_press_ms = now;
+            app.sel_suppress = true;
+        } else if (in_now.start) {
+            app.sel_suppress = true;   /* 组合键路线：SHARE 一直压着 */
+        } else if (app.sel_suppress && now - app.sel_press_ms >= 250) {
+            app.sel_suppress = false;  /* 没等到 START，正常发 SHARE */
+        }
+    } else {
+        if (app.sel_press_ms && app.sel_suppress && !app.opt_press_ms) {
+            /* SELECT 在 250ms 内快速点按、且没碰 START：
+             * 补发一次 120ms 的 SHARE 点击，不然这次按键就丢了 */
+            app.tap_bits = CHIAKI_CONTROLLER_BUTTON_SHARE;
+            app.tap_until = now + 120;
+        }
+        app.sel_press_ms = 0;
+        app.sel_suppress = false;
     }
-    if (app.opt_held) {
-        if (!app.opt_fired && (now - app.opt_press_ms) >= 800) {
-            /* 按住满 800ms 立刻发 OPTIONS，不用等松手 */
+    if (in_now.select && in_now.start) {
+        if (!app.opt_press_ms) {
+            app.opt_press_ms = now;
+        } else if (!app.opt_fired && (now - app.opt_press_ms) >= 400) {
             app.opt_fired = true;
             app.tap_bits = CHIAKI_CONTROLLER_BUTTON_OPTIONS;
             app.tap_until = now + 120;
         }
-        if (!in_now.start) {
-            app.opt_held = false;
-            if (!app.opt_fired) {   /* 短按 = 触摸板 */
-                app.tap_bits = CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
-                app.tap_until = now + 120;
-            }
-        }
+    } else {
+        app.opt_press_ms = 0;
+        app.opt_fired = false;
     }
 
     /* feed controller state */
@@ -2036,8 +2053,11 @@ static void update_stream(void)
     if (in_now.l3) st.buttons |= CHIAKI_CONTROLLER_BUTTON_L3;
     if (in_now.r3) st.buttons |= CHIAKI_CONTROLLER_BUTTON_R3;
     if (in_now.touchpad) st.buttons |= CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+    /* START 按住期间触摸板保持按下（松手即抬起，短按就是普通点击）；
+     * 与 SELECT 同按视为 OPTIONS 组合键，此时不发触摸板 */
+    if (in_now.start && !in_now.select) st.buttons |= CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
     if (app.tap_until > now) st.buttons |= app.tap_bits;
-    if (in_now.select) st.buttons |= CHIAKI_CONTROLLER_BUTTON_SHARE;
+    if (in_now.select && !app.sel_suppress) st.buttons |= CHIAKI_CONTROLLER_BUTTON_SHARE;
     if (in_now.ps) st.buttons |= CHIAKI_CONTROLLER_BUTTON_PS;
     st.left_x = (int16_t)in_now.lx;
     st.left_y = (int16_t)in_now.ly;
