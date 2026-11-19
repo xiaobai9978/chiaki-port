@@ -77,6 +77,7 @@ typedef struct {
     int  swap_xy;
     int  rumble;       /* 震动强度 0..100，0 = 关闭 */
     int  vsync;        /* 1 = 开垂直同步（默认），0 = 关，串流追帧率时关掉 */
+    int  osd;          /* 1 = 串流画面显示状态 OSD（默认），0 = 隐藏 */
     int  loglevel;     /* chiaki log bitmask: 7 = info, 15 = +verbose, 31 = +debug */
     int  key[ACT_COUNT];
 } Config;
@@ -165,6 +166,7 @@ static struct {
     uint32_t tap_bits;
     bool stream_quit_pending;
     int  stream_quit_reason;
+    Uint32 cancel_hold_t0;   /* 串流「正在连接」界面长按 A 的计时（0=没按） */
 
     /* 串流 OSD 缓存：每帧画几十个字符会吃掉 3-4fps，改成离屏纹理只在内容变化时重绘 */
     SDL_Texture *osd_top;
@@ -259,6 +261,7 @@ static void config_defaults(Config *c)
     c->swap_xy = 0;
     c->rumble = 60;
     c->vsync = 1;
+    c->osd = 1;
     c->loglevel = 7;
     for (int i = 0; i < ACT_COUNT; i++)
         c->key[i] = act_defaults[i];
@@ -315,6 +318,7 @@ static void config_load(const char *path)
         else if (!strcmp(k, "swap_xy")) app.cfg.swap_xy = atoi(v);
         else if (!strcmp(k, "rumble")) app.cfg.rumble = atoi(v);
         else if (!strcmp(k, "vsync")) app.cfg.vsync = atoi(v);
+        else if (!strcmp(k, "osd")) app.cfg.osd = atoi(v);
         else if (!strcmp(k, "loglevel")) app.cfg.loglevel = atoi(v);
         else if (!strncmp(k, "key_", 4)) {
             int idx = atoi(k + 4);
@@ -333,6 +337,7 @@ static void config_load(const char *path)
     if (app.cfg.hwdec != 0 && app.cfg.hwdec != 1)            app.cfg.hwdec = 0;
     if (app.cfg.rumble < 0 || app.cfg.rumble > 100)          app.cfg.rumble = 60;
     if (app.cfg.vsync != 0 && app.cfg.vsync != 1)            app.cfg.vsync = 1;
+    if (app.cfg.osd != 0 && app.cfg.osd != 1)                app.cfg.osd = 1;
     if (app.cfg.loglevel < 1 || app.cfg.loglevel > 31)       app.cfg.loglevel = 7;
 }
 
@@ -372,6 +377,7 @@ static void config_save(void)
     fprintf(f, "swap_xy=%d\n", app.cfg.swap_xy);
     fprintf(f, "rumble=%d\n", app.cfg.rumble);
     fprintf(f, "vsync=%d\n", app.cfg.vsync);
+    fprintf(f, "osd=%d\n", app.cfg.osd);
     fprintf(f, "loglevel=%d\n", app.cfg.loglevel);
     for (int i = 0; i < ACT_COUNT; i++)
         fprintf(f, "key_%d=%d\n", i, app.cfg.key[i]);
@@ -1090,120 +1096,121 @@ static void draw_stream(void)
     }
     stream_render(app.ren, dst);
 
-    /* CHIAKI_NOOSD=1 时只画视频帧，不画任何文字，用来量化 OSD 的 draw call 开销 */
-    if (g_noosd)
-        return;
-
     /* 16:9 画面在 4:3 屏上留出上下黑边，提示信息优先写在黑边里 */
     int top_h = dst.y;
     int bot_y = dst.y + dst.h;
     int bot_h = H - bot_y;
 
     if (!stream_connected()) {
+        /* 连接状态反馈不受 OSD 开关影响——关 OSD 的人更需要看到它卡住了 */
         ui_text_centered(W / 2, dst.y + dst.h / 2 - 16, UI_SIZE_NORMAL, C_TEXT, "正在连接…");
-    } else {
-        /* 每秒采样一次统计值；中间帧沿用上次的数字，避免 OSD 疯狂重绘 */
-        int frames = 0;   /* stream_get_stats 需要这个出参，界面不再显示 */
-        Uint32 now_ms = SDL_GetTicks();
-        bool osd_sampled = false;
-        if (app.osd_s_t0 == 0 || (Uint32)(now_ms - app.osd_s_t0) >= 1000) {
-            stream_get_stats(&app.osd_s_fps, &frames, &app.osd_s_proc,
-                             &app.osd_s_rtt, &app.osd_s_lost, &app.osd_s_hwdec,
-                             &app.osd_s_dec, &app.osd_s_kbps);
-            (void)frames;
-            /* 码率统一用 k（用户要求），6Mbps 显示 6000k 也够直观 */
-            snprintf(app.osd_s_rate, sizeof(app.osd_s_rate), "%dk",
-                     app.osd_s_kbps);
-            app.osd_s_temp = read_soc_temp();
-            app.osd_s_t0 = now_ms ? now_ms : 1;
-            osd_sampled = true;
-        }
-        int fps = app.osd_s_fps, proc = app.osd_s_proc;
-        int rtt = app.osd_s_rtt, lost = app.osd_s_lost, dec = app.osd_s_dec;
-        bool hwdec = app.osd_s_hwdec;
-        int want_fps = app.cfg.fps;
-        const char *rate = app.osd_s_rate;
-        char temp_txt[16] = "";
-        if (app.osd_s_temp >= 0)
-            snprintf(temp_txt, sizeof(temp_txt), "  %d°C", app.osd_s_temp);
+        ui_text_centered(W / 2, dst.y + dst.h / 2 + 22, UI_SIZE_SMALL, C_DIM,
+                         "长按 A(○) 0.7 秒取消");
+        return;
+    }
+    if (g_noosd || !app.cfg.osd)
+        return;
+    /* 每秒采样一次统计值；中间帧沿用上次的数字，避免 OSD 疯狂重绘 */
+    int frames = 0;   /* stream_get_stats 需要这个出参，界面不再显示 */
+    Uint32 now_ms = SDL_GetTicks();
+    bool osd_sampled = false;
+    if (app.osd_s_t0 == 0 || (Uint32)(now_ms - app.osd_s_t0) >= 1000) {
+        stream_get_stats(&app.osd_s_fps, &frames, &app.osd_s_proc,
+                         &app.osd_s_rtt, &app.osd_s_lost, &app.osd_s_hwdec,
+                         &app.osd_s_dec, &app.osd_s_kbps);
+        (void)frames;
+        /* 码率统一用 k（用户要求），6Mbps 显示 6000k 也够直观 */
+        snprintf(app.osd_s_rate, sizeof(app.osd_s_rate), "%dk",
+                 app.osd_s_kbps);
+        app.osd_s_temp = read_soc_temp();
+        app.osd_s_t0 = now_ms ? now_ms : 1;
+        osd_sampled = true;
+    }
+    int fps = app.osd_s_fps, proc = app.osd_s_proc;
+    int rtt = app.osd_s_rtt, lost = app.osd_s_lost, dec = app.osd_s_dec;
+    bool hwdec = app.osd_s_hwdec;
+    int want_fps = app.cfg.fps;
+    const char *rate = app.osd_s_rate;
+    char temp_txt[16] = "";
+    if (app.osd_s_temp >= 0)
+        snprintf(temp_txt, sizeof(temp_txt), "  %d°C", app.osd_s_temp);
 
-        if (top_h >= 34) {
-            /* 顶部 OSD 缓存到离屏纹理：字符多，每帧重绘要 30+ 次 draw call */
-            /* key 只在 1Hz 采样帧构造：以前每帧都做一次 11 个字段的
-             * snprintf，即使内容整整一秒不变。每帧只留一次 strcmp。 */
-            if (osd_sampled || app.osd_key_buf[0] == 0)
-                snprintf(app.osd_key_buf, sizeof(app.osd_key_buf),
-                         "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s",
-                         fw, fh, app.cfg.codec, (int)hwdec, fps, dec, proc, rtt, lost,
-                         want_fps, rate, temp_txt);
-            if (app.osd_top && app.osd_w != W) {
-                SDL_DestroyTexture(app.osd_top);
-                app.osd_top = NULL;
-            }
-            if (!app.osd_top) {
-                app.osd_top = SDL_CreateTexture(app.ren, SDL_PIXELFORMAT_ARGB8888,
-                                                SDL_TEXTUREACCESS_TARGET, W, 34);
-                if (app.osd_top)
-                    SDL_SetTextureBlendMode(app.osd_top, SDL_BLENDMODE_BLEND);
-                app.osd_w = W;
-                app.osd_key[0] = 0;
-            }
-            if (app.osd_top && strcmp(app.osd_key_buf, app.osd_key) != 0) {
-                SDL_SetRenderTarget(app.ren, app.osd_top);
+    if (top_h >= 34) {
+        /* 顶部 OSD 缓存到离屏纹理：字符多，每帧重绘要 30+ 次 draw call */
+        /* key 只在 1Hz 采样帧构造：以前每帧都做一次 11 个字段的
+         * snprintf，即使内容整整一秒不变。每帧只留一次 strcmp。 */
+        if (osd_sampled || app.osd_key_buf[0] == 0)
+            snprintf(app.osd_key_buf, sizeof(app.osd_key_buf),
+                     "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s",
+                     fw, fh, app.cfg.codec, (int)hwdec, fps, dec, proc, rtt, lost,
+                     want_fps, rate, temp_txt);
+        if (app.osd_top && app.osd_w != W) {
+            SDL_DestroyTexture(app.osd_top);
+            app.osd_top = NULL;
+        }
+        if (!app.osd_top) {
+            app.osd_top = SDL_CreateTexture(app.ren, SDL_PIXELFORMAT_ARGB8888,
+                                            SDL_TEXTUREACCESS_TARGET, W, 34);
+            if (app.osd_top)
+                SDL_SetTextureBlendMode(app.osd_top, SDL_BLENDMODE_BLEND);
+            app.osd_w = W;
+            app.osd_key[0] = 0;
+        }
+        if (app.osd_top && strcmp(app.osd_key_buf, app.osd_key) != 0) {
+            SDL_SetRenderTarget(app.ren, app.osd_top);
+            SDL_SetRenderDrawColor(app.ren, 0, 0, 0, 0);
+            SDL_RenderClear(app.ren);
+            ui_text(24, 2, UI_SIZE_SMALL, C_ACCENT, "PS5 串流  %dx%d  %s · %s",
+                    fw, fh, app.cfg.codec ? "H.265" : "H.264", hwdec ? "硬解" : "软解");
+            if (rtt >= 0)
+                ui_text_right(W - 24, 2, UI_SIZE_SMALL, C_ACCENT,
+                              "%d/%d fps  解 %dms  转 %dms  RTT %dms  丢 %d  码 %s%s",
+                              fps, want_fps, dec, proc, rtt, lost, rate, temp_txt);
+            else
+                ui_text_right(W - 24, 2, UI_SIZE_SMALL, C_ACCENT,
+                              "%d/%d fps  解 %dms  转 %dms  丢 %d  码 %s%s",
+                              fps, want_fps, dec, proc, lost, rate, temp_txt);
+            SDL_SetRenderTarget(app.ren, NULL);
+            snprintf(app.osd_key, sizeof(app.osd_key), "%s", app.osd_key_buf);
+        }
+        if (app.osd_top) {
+            SDL_Rect r = { 0, dst.y - 34, W, 34 };
+            SDL_RenderCopy(app.ren, app.osd_top, NULL, &r);
+        }
+    } else {
+        ui_text(20, 8, UI_SIZE_SMALL, C_ACCENT,
+                "%d/%d fps  解%d 转%d  RTT%d  丢%d  码%s%s",
+                fps, want_fps, dec, proc, rtt, lost, rate, temp_txt);
+    }
+
+    /* 纹理高度必须容得下第二行文字（y=22 + 字高约 20），34px 会把下半截裁掉 */
+    if (bot_h >= 48) {
+        /* 两行提示是固定文字，以前每帧要走 45+ 次 glyph 查询和 draw call；
+         * 和顶部 OSD 一样预渲染成离屏纹理，之后每帧只 RenderCopy 一次。
+         * 顺序按实际按键：PS -> SHARE -> START(触摸板/OPTIONS)，菜单单独一行 */
+        if (app.osd_hint && app.osd_hint_w != W) {
+            SDL_DestroyTexture(app.osd_hint);
+            app.osd_hint = NULL;
+        }
+        if (!app.osd_hint) {
+            app.osd_hint = SDL_CreateTexture(app.ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_TARGET, W, 48);
+            if (app.osd_hint) {
+                SDL_SetTextureBlendMode(app.osd_hint, SDL_BLENDMODE_BLEND);
+                SDL_SetRenderTarget(app.ren, app.osd_hint);
                 SDL_SetRenderDrawColor(app.ren, 0, 0, 0, 0);
                 SDL_RenderClear(app.ren);
-                ui_text(24, 2, UI_SIZE_SMALL, C_ACCENT, "PS5 串流  %dx%d  %s · %s",
-                        fw, fh, app.cfg.codec ? "H.265" : "H.264", hwdec ? "硬解" : "软解");
-                if (rtt >= 0)
-                    ui_text_right(W - 24, 2, UI_SIZE_SMALL, C_ACCENT,
-                                  "%d/%d fps  解 %dms  转 %dms  RTT %dms  丢 %d  码 %s%s",
-                                  fps, want_fps, dec, proc, rtt, lost, rate, temp_txt);
-                else
-                    ui_text_right(W - 24, 2, UI_SIZE_SMALL, C_ACCENT,
-                                  "%d/%d fps  解 %dms  转 %dms  丢 %d  码 %s%s",
-                                  fps, want_fps, dec, proc, lost, rate, temp_txt);
+                ui_text_centered(W / 2, 2, UI_SIZE_SMALL, C_DIM,
+                                 "GUIDE=PS   SELECT=SHARE   START=触摸板/长按=OPTIONS");
+                ui_text_centered(W / 2, 22, UI_SIZE_SMALL, C_DIM,
+                                 "L1+R1+L3+R3=菜单");
                 SDL_SetRenderTarget(app.ren, NULL);
-                snprintf(app.osd_key, sizeof(app.osd_key), "%s", app.osd_key_buf);
+                app.osd_hint_w = W;
             }
-            if (app.osd_top) {
-                SDL_Rect r = { 0, dst.y - 34, W, 34 };
-                SDL_RenderCopy(app.ren, app.osd_top, NULL, &r);
-            }
-        } else {
-            ui_text(20, 8, UI_SIZE_SMALL, C_ACCENT,
-                    "%d/%d fps  解%d 转%d  RTT%d  丢%d  码%s%s",
-                    fps, want_fps, dec, proc, rtt, lost, rate, temp_txt);
         }
-
-        /* 纹理高度必须容得下第二行文字（y=22 + 字高约 20），34px 会把下半截裁掉 */
-        if (bot_h >= 48) {
-            /* 两行提示是固定文字，以前每帧要走 45+ 次 glyph 查询和 draw call；
-             * 和顶部 OSD 一样预渲染成离屏纹理，之后每帧只 RenderCopy 一次。
-             * 顺序按实际按键：PS -> SHARE -> START(触摸板/OPTIONS)，菜单单独一行 */
-            if (app.osd_hint && app.osd_hint_w != W) {
-                SDL_DestroyTexture(app.osd_hint);
-                app.osd_hint = NULL;
-            }
-            if (!app.osd_hint) {
-                app.osd_hint = SDL_CreateTexture(app.ren, SDL_PIXELFORMAT_ARGB8888,
-                                                 SDL_TEXTUREACCESS_TARGET, W, 48);
-                if (app.osd_hint) {
-                    SDL_SetTextureBlendMode(app.osd_hint, SDL_BLENDMODE_BLEND);
-                    SDL_SetRenderTarget(app.ren, app.osd_hint);
-                    SDL_SetRenderDrawColor(app.ren, 0, 0, 0, 0);
-                    SDL_RenderClear(app.ren);
-                    ui_text_centered(W / 2, 2, UI_SIZE_SMALL, C_DIM,
-                                     "GUIDE=PS   SELECT=SHARE   START=触摸板/长按=OPTIONS");
-                    ui_text_centered(W / 2, 22, UI_SIZE_SMALL, C_DIM,
-                                     "L1+R1+L3+R3=菜单");
-                    SDL_SetRenderTarget(app.ren, NULL);
-                    app.osd_hint_w = W;
-                }
-            }
-            if (app.osd_hint) {
-                SDL_Rect r = { 0, bot_y, W, 48 };
-                SDL_RenderCopy(app.ren, app.osd_hint, NULL, &r);
-            }
+        if (app.osd_hint) {
+            SDL_Rect r = { 0, bot_y, W, 48 };
+            SDL_RenderCopy(app.ren, app.osd_hint, NULL, &r);
         }
     }
 }
@@ -1236,7 +1243,7 @@ static void draw_settings(void)
 
     ui_text(40, 26, UI_SIZE_LARGE, C_TEXT, "设置");
 
-    char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
+    char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32], b8[32];
     snprintf(b1, sizeof(b1), "%s", res_name(app.cfg.resolution));
     snprintf(b2, sizeof(b2), "%d", app.cfg.fps);
     snprintf(b3, sizeof(b3), "%d kbps", app.cfg.bitrate);
@@ -1247,18 +1254,19 @@ static void draw_settings(void)
         snprintf(b5, sizeof(b5), "%d%%", app.cfg.rumble);
     snprintf(b6, sizeof(b6), "%s", app.cfg.autoconnect ? "开" : "关");
     snprintf(b7, sizeof(b7), "%s", app.cfg.hwdec ? "硬解" : "软解");
+    snprintf(b8, sizeof(b8), "%s", app.cfg.osd ? "显示" : "隐藏");
 
-    const char *labels[7] = { "分辨率", "帧率", "码率", "编码", "震动", "开机直连", "硬解" };
-    const char *values[7] = { b1, b2, b3, b4, b5, b6, b7 };
+    const char *labels[8] = { "分辨率", "帧率", "码率", "编码", "震动", "开机直连", "硬解", "状态OSD" };
+    const char *values[8] = { b1, b2, b3, b4, b5, b6, b7, b8 };
 
-    int y = 104;
-    for (int i = 0; i < 7; i++) {
-        SDL_Rect r = { 32, y, W - 64, 72 };
+    int y = 100;
+    for (int i = 0; i < 8; i++) {
+        SDL_Rect r = { 32, y, W - 64, 64 };
         bool sel = (i == app.settings_sel);
         ui_rect(r.x, r.y, r.w, r.h, sel ? C_SEL : C_PANEL);
-        ui_text(r.x + 20, r.y + 21, UI_SIZE_NORMAL, C_TEXT, "%s", labels[i]);
-        ui_text_right(r.x + r.w - 20, r.y + 21, UI_SIZE_NORMAL, C_ACCENT, "%s", values[i]);
-        y += 80;
+        ui_text(r.x + 20, r.y + 17, UI_SIZE_NORMAL, C_TEXT, "%s", labels[i]);
+        ui_text_right(r.x + r.w - 20, r.y + 17, UI_SIZE_NORMAL, C_ACCENT, "%s", values[i]);
+        y += 72;
     }
 
     ui_text(40, H - 70, UI_SIZE_SMALL, C_DIM,
@@ -1303,6 +1311,9 @@ static void apply_settings_delta(int dir)
         break;
     case 6:
         app.cfg.hwdec = !app.cfg.hwdec;
+        break;
+    case 7:
+        app.cfg.osd = !app.cfg.osd;
         break;
     default:
         return;
@@ -1943,6 +1954,33 @@ static void update_stream(void)
 {
     Uint32 now = SDL_GetTicks();
 
+    /* 会话还没建立时（黑屏「正在连接…」）长按 A(○) 0.7 秒取消，回主机列表。
+     * 之前只有 wait_tick（端口探测阶段）有取消，stream_start 成功后等 ctrl
+     * 握手这段没有任何出口——TCP 通但会话起不来（PS5 被别的设备占着、
+     * 跨网段打洞半通）就永远卡在这，按什么键都只会发给 PS5。
+     * 已连上之后长按 A 仍然是正常的 ○ 键，不能拦。 */
+    if (!stream_connected() && !app.stream_quit_pending) {
+        if (!in_now.back) {
+            app.cancel_hold_t0 = 0;
+        } else {
+            if (!app.cancel_hold_t0) {
+                app.cancel_hold_t0 = now;
+            } else if (now - app.cancel_hold_t0 > 700) {
+                app.cancel_hold_t0 = 0;
+                SDL_Log("stream: user cancelled connect (long-press A)");
+                stream_stop_rumble();
+                stream_stop();
+                discovery_start();
+                osd_reset();
+                message("已取消", "连接超时或被取消。可尝试唤醒主机（L1）后重连，\n"
+                        "或确认 PS5 没有其他设备正在远程游玩。");
+                return;
+            }
+        }
+    } else {
+        app.cancel_hold_t0 = 0;
+    }
+
     /* 单击 START = 触摸板，长按（>=600ms）= OPTIONS —— 掌机没有独立触摸板键 */
     if (pressed(in_now.start, in_prev.start)) {
         app.opt_press_ms = now;
@@ -2098,15 +2136,15 @@ static void update_menu(void)
 static void update_settings(void)
 {
     if (pressed(in_now.up, in_prev.up))
-        app.settings_sel = (app.settings_sel + 6) % 7;
+        app.settings_sel = (app.settings_sel + 7) % 8;
     if (pressed(in_now.down, in_prev.down))
-        app.settings_sel = (app.settings_sel + 1) % 7;
+        app.settings_sel = (app.settings_sel + 1) % 8;
     if (pressed(in_now.left, in_prev.left))
         apply_settings_delta(-1);
     if (pressed(in_now.right, in_prev.right))
         apply_settings_delta(1);
     if (pressed(in_now.confirm, in_prev.confirm))
-        app.settings_sel = (app.settings_sel + 1) % 7;
+        app.settings_sel = (app.settings_sel + 1) % 8;
     if (pressed(in_now.back, in_prev.back))
         app.screen = SCR_HOSTS;
 }
