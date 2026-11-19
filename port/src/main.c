@@ -167,6 +167,9 @@ static struct {
     bool stream_quit_pending;
     int  stream_quit_reason;
     Uint32 cancel_hold_t0;   /* 串流「正在连接」界面长按 A 的计时（0=没按） */
+    Uint32 osd_hot_t0;       /* L3+R3 同按计时，满 8 秒切换状态 OSD */
+    bool   osd_hot_fired;    /* 本次按住已触发过，松手前不再重复切 */
+    Uint32 osd_toast_until;  /* OSD 开关反馈条的显示截止时间 */
 
     /* 串流 OSD 缓存：每帧画几十个字符会吃掉 3-4fps，改成离屏纹理只在内容变化时重绘 */
     SDL_Texture *osd_top;
@@ -1101,6 +1104,16 @@ static void draw_stream(void)
     int bot_y = dst.y + dst.h;
     int bot_h = H - bot_y;
 
+    /* L3+R3 切换 OSD 的反馈条：必须画在 OSD 开关与连接判断之前，
+     * 否则「关到开」看得到、「开到关」或者还没连上时按，都像没生效一样。 */
+    if (app.osd_toast_until && SDL_GetTicks() < app.osd_toast_until) {
+        SDL_Rect bar = { W / 2 - 150, H - 66, 300, 44 };
+        ui_rect(bar.x, bar.y, bar.w, bar.h, (SDL_Color){ 0, 0, 0, 170 });
+        ui_frame(bar.x, bar.y, bar.w, bar.h, C_SEL, 2);
+        ui_text_centered(W / 2, bar.y + 12, UI_SIZE_SMALL, C_ACCENT,
+                         app.cfg.osd ? "状态 OSD：显示" : "状态 OSD：隐藏");
+    }
+
     if (!stream_connected()) {
         /* 连接状态反馈不受 OSD 开关影响——关 OSD 的人更需要看到它卡住了 */
         ui_text_centered(W / 2, dst.y + dst.h / 2 - 16, UI_SIZE_NORMAL, C_TEXT, "正在连接…");
@@ -1108,6 +1121,7 @@ static void draw_stream(void)
                          "长按 A(○) 0.7 秒取消");
         return;
     }
+    /* 提示文字属于黑边信息区，跟随 OSD 开关；CHIAKI_NOOSD=1 是调试用的强制关闭 */
     if (g_noosd || !app.cfg.osd)
         return;
     /* 每秒采样一次统计值；中间帧沿用上次的数字，避免 OSD 疯狂重绘 */
@@ -1202,8 +1216,8 @@ static void draw_stream(void)
                 SDL_RenderClear(app.ren);
                 ui_text_centered(W / 2, 2, UI_SIZE_SMALL, C_DIM,
                                  "GUIDE=PS   SELECT=SHARE   START=触摸板/长按=OPTIONS");
-                ui_text_centered(W / 2, 22, UI_SIZE_SMALL, C_DIM,
-                                 "L1+R1+L3+R3=菜单");
+                    ui_text_centered(W / 2, 22, UI_SIZE_SMALL, C_DIM,
+                                     "L1+R1+L3+R3=菜单   L3+R3 按住 8 秒=OSD 开关");
                 SDL_SetRenderTarget(app.ren, NULL);
                 app.osd_hint_w = W;
             }
@@ -1270,7 +1284,7 @@ static void draw_settings(void)
     }
 
     ui_text(40, H - 70, UI_SIZE_SMALL, C_DIM,
-            "左右键改数值    B(×) 下一项    A(○) 返回");
+            "左右键改数值    B(×) 下一项    A(○) 返回    串流中 L3+R3 按 8 秒切 OSD");
     ui_text(40, H - 42, UI_SIZE_SMALL, C_DIM,
             "主机的名称和地址在主界面按 L2 修改");
 }
@@ -2048,6 +2062,26 @@ static void update_stream(void)
 
     /* 震动：session 线程只记录强度，这里每帧负责真正驱动掌机马达（sysfs） */
     stream_apply_rumble(app.cfg.rumble);
+
+    /* 快捷键：L3+R3（两个摇杆同时按下）保持 8 秒切换状态 OSD。
+     * 与串流菜单组合键 L1+R1+L3+R3 不冲突（那组要求 L1/R1 也按着）。
+     * 期间照常把摇杆按下发给 PS5（L3/R3 是合法游戏键），不做拦截。 */
+    if (in_now.l3 && in_now.r3) {
+        if (!app.osd_hot_fired) {
+            if (!app.osd_hot_t0)
+                app.osd_hot_t0 = now;
+            else if (now - app.osd_hot_t0 >= 8000) {
+                app.osd_hot_fired = true;
+                app.cfg.osd = !app.cfg.osd;
+                config_save();
+                app.osd_toast_until = now + 2000;
+                SDL_Log("stream: OSD toggled to %d by L3+R3 hold 8s", app.cfg.osd);
+            }
+        }
+    } else {
+        app.osd_hot_t0 = 0;
+        app.osd_hot_fired = false;
+    }
 
     /* 每 5 秒把统计写进 chiaki.log：调帧率/码率时不用盯着黑边看，事后翻日志就行 */
     if (app.stats_t0 == 0) {
